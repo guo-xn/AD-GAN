@@ -4,6 +4,54 @@ from torchvision import models
 import torch
 from torch import autograd
 import pytorch_msssim
+import numpy as np
+
+
+class PairwiseScore:
+    def __init__(self):
+        self.individual_values = np.array([])
+
+    def reset(self):
+        self.individual_values = np.array([])
+
+
+class PerceptualLoss(nn.Module):
+    def __init__(self, model='net-lin', net='vgg', model_path=None, use_gpu=True, spatial=False):
+        super(PerceptualLoss, self).__init__()
+        if net == 'alex':
+            from lpips import models
+            self.model = models.AlexNet(model_path=model_path).eval()
+        elif net == 'vgg':
+            from lpips import models
+            self.model = models.VGG16(model_path=model_path).eval()
+        else:
+            raise NotImplementedError(f"Model {net} not supported in PerceptualLoss")
+        if use_gpu and torch.cuda.is_available():
+            self.model.cuda()
+
+    def forward(self, pred_batch, target_batch):
+        return self.model(pred_batch, target_batch).mean(dim=[1, 2, 3])
+
+
+class LPIPSScore(PairwiseScore):
+    def __init__(self, model='net-lin', net='vgg', model_path=None, use_gpu=True):
+        super().__init__()
+        self.score = PerceptualLoss(
+            model=model,
+            net=net,
+            model_path=model_path,
+            use_gpu=use_gpu,
+            spatial=False
+        ).eval()
+        self.reset()
+
+    def forward(self, pred_batch, target_batch, mask=None):
+        batch_values = self.score(pred_batch, target_batch).flatten()
+        self.individual_values = np.hstack([
+            self.individual_values, batch_values.detach().cpu().numpy()
+        ])
+        return batch_values
+
 
 
 def compute_G_loss(models, args, image, m_image, mask, label, device):
@@ -23,49 +71,32 @@ def compute_G_loss(models, args, image, m_image, mask, label, device):
     # WGAN_GP: fake to real
     adv_fake_loss = cmp_D.mean().sum() * 1
 
-    # completion loss
-    extractor = VGG16FeatureExtractor().to(device)
+    # Initialize LPIPS model
+    lpips_model = LPIPSScore(model='net-lin', net='alex', use_gpu=device).to(device)
 
-    l1 = nn.L1Loss()
-    # L1 loss
-    hole_loss = l1((1 - mask) * completion_image, (1 - mask) * image)
-    valid_loss = l1(mask * completion_image, mask * image)
-    output_comp = mask * image + (1 - mask) * completion_image
-
-    feat_output_comp = extractor(output_comp)
-    feat_output = extractor(completion_image)
-    feat_gt = extractor(image)
-
-    # vgg High Receptive Field perceptual loss
-    prc_loss = 0.0
-    for i in range(3):
-        prc_loss += l1(feat_output[i], feat_gt[i])
-        prc_loss += l1(feat_output_comp[i], feat_gt[i])
-    
-    class LPIPSScore(PairwiseScore):
-    def __init__(self, model='net-lin', net='vgg', model_path=None, use_gpu=True):
-        super().__init__()
-        self.score = PerceptualLoss(model=model, net=net, model_path=model_path,
-                                    use_gpu=use_gpu, spatial=False).eval()
-        self.reset()
-
-    def forward(self, pred_batch, target_batch, mask=None):
-        batch_values = self.score(pred_batch, target_batch).flatten()
-        self.individual_values = np.hstack([
-            self.individual_values, batch_values.detach().cpu().numpy()
-        ])
-        return batch_values
-
-    # vgg style loss
-    vgg_style_loss = 0.0
-    for i in range(3):
-        vgg_style_loss += l1(gram_matrix(feat_output[i]), gram_matrix(feat_gt[i]))
-        vgg_style_loss += l1(gram_matrix(feat_output_comp[i]), gram_matrix(feat_gt[i]))
+    # Compute LPIPS loss
+    prc_loss = lpips_model(completion_image, image).mean()
 
     # MS-SSIM LOSS
     loss_ms_ssim = pytorch_msssim.MS_SSIM(data_range=1)
     loss_ms_ssim.to(device)
-    loss_ms_ssim_value = (1 - loss_ms_ssim((output_comp + 1) * 0.5, (image + 1) * 0.5))
+    loss_ms_ssim_value = (1 - loss_ms_ssim((completion_image + 1) * 0.5, (image + 1) * 0.5))
+
+    # hole and valid loss
+    l1 = nn.L1Loss()
+    hole_loss = l1((1 - mask) * completion_image, (1 - mask) * image)
+    valid_loss = l1(mask * completion_image, mask * image)
+
+    # style loss still uses gram matrix
+    feat_output = []  
+    feat_gt = []
+
+    vgg_style_loss = 0.0
+    extractor = VGG16FeatureExtractor().to(device)
+    feat_output = extractor(completion_image)
+    feat_gt = extractor(image)
+    for i in range(3):
+        vgg_style_loss += l1(gram_matrix(feat_output[i]), gram_matrix(feat_gt[i]))
 
     MSELoss = torch.nn.MSELoss()
     label_loss = MSELoss(cls_D, ori_pred_lbl.float())
